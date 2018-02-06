@@ -51,6 +51,7 @@ march_cycle_delivery_predicate = partial(delivery_predicate,
                                          set(['H', 'M', 'U', 'Z']))
 
 CHAIN_PREDICATES = {
+    'EL': march_cycle_delivery_predicate,
     'ME': march_cycle_delivery_predicate,
     'PL': partial(delivery_predicate, set(['F', 'J', 'N', 'V'])),
     'PA': march_cycle_delivery_predicate,
@@ -64,6 +65,12 @@ CHAIN_PREDICATES = {
     'CD': march_cycle_delivery_predicate,
     'AD': march_cycle_delivery_predicate,
     'BP': march_cycle_delivery_predicate,
+
+    # Gold and silver contracts trade on an unusual specific set of months.
+    'GC': partial(delivery_predicate, set(['G', 'J', 'M', 'Q', 'V', 'Z'])),
+    'XG': partial(delivery_predicate, set(['G', 'J', 'M', 'Q', 'V', 'Z'])),
+    'SV': partial(delivery_predicate, set(['H', 'K', 'N', 'U', 'Z'])),
+    'YS': partial(delivery_predicate, set(['H', 'K', 'N', 'U', 'Z'])),
 }
 
 ADJUSTMENT_STYLES = {'add', 'mul', None}

@@ -14,19 +14,23 @@
 # limitations under the License.
 from __future__ import division
 
-from abc import ABCMeta, abstractmethod, abstractproperty
+from abc import abstractmethod
 import math
-from six import with_metaclass, iteritems
-from toolz import merge
 
 import numpy as np
 from pandas import isnull
+from six import with_metaclass
+from toolz import merge
 
 from zipline.assets import Equity, Future
+from zipline.errors import HistoryWindowStartsBeforeData
 from zipline.finance.constants import ROOT_SYMBOL_TO_ETA
+from zipline.finance.shared import AllowedAssetMarker, FinancialModelMeta
 from zipline.finance.transaction import create_transaction
 from zipline.utils.cache import ExpiringCache
 from zipline.utils.dummy import DummyMapping
+from zipline.utils.input_validation import (expect_bounded,
+                                            expect_strictly_bounded)
 
 SELL = 1 << 0
 BUY = 1 << 1
@@ -36,8 +40,7 @@ LIMIT = 1 << 3
 SQRT_252 = math.sqrt(252)
 
 DEFAULT_EQUITY_VOLUME_SLIPPAGE_BAR_LIMIT = 0.025
-DEFAULT_FUTURE_VOLUME_SLIPPAGE_BAR_LIMIT = 0.025
-NO_DATA_VOLATILITY_SLIPPAGE_IMPACT = 10.0 / 10000
+DEFAULT_FUTURE_VOLUME_SLIPPAGE_BAR_LIMIT = 0.05
 
 
 class LiquidityExceeded(Exception):
@@ -77,7 +80,7 @@ def fill_price_worse_than_limit_price(fill_price, order):
     return False
 
 
-class SlippageModel(with_metaclass(ABCMeta)):
+class SlippageModel(with_metaclass(FinancialModelMeta)):
     """Abstract interface for defining a slippage model.
     """
 
@@ -91,7 +94,7 @@ class SlippageModel(with_metaclass(ABCMeta)):
     def volume_for_bar(self):
         return self._volume_for_bar
 
-    @abstractproperty
+    @abstractmethod
     def process_order(self, data, order):
         """Process how orders get filled.
 
@@ -162,27 +165,18 @@ class SlippageModel(with_metaclass(ABCMeta)):
                 self._volume_for_bar += abs(txn.amount)
                 yield order, txn
 
-    def __eq__(self, other):
-        return self.asdict() == other.asdict()
-
-    def __hash__(self):
-        return hash((
-            type(self),
-            tuple(sorted(iteritems(self.asdict())))
-        ))
-
     def asdict(self):
         return self.__dict__
 
 
-class EquitySlippageModel(SlippageModel):
+class EquitySlippageModel(with_metaclass(AllowedAssetMarker, SlippageModel)):
     """
     Base class for slippage models which only support equities.
     """
     allowed_asset_types = (Equity,)
 
 
-class FutureSlippageModel(SlippageModel):
+class FutureSlippageModel(with_metaclass(AllowedAssetMarker, SlippageModel)):
     """
     Base class for slippage models which only support futures.
     """
@@ -193,15 +187,13 @@ class VolumeShareSlippage(SlippageModel):
     """
     Model slippage as a function of the volume of contracts traded.
     """
-    allowed_asset_types = (Equity, Future)
-
     def __init__(self, volume_limit=DEFAULT_EQUITY_VOLUME_SLIPPAGE_BAR_LIMIT,
                  price_impact=0.1):
 
+        super(VolumeShareSlippage, self).__init__()
+
         self.volume_limit = volume_limit
         self.price_impact = price_impact
-
-        super(VolumeShareSlippage, self).__init__()
 
     def __repr__(self):
         return """
@@ -271,9 +263,8 @@ class FixedSlippage(SlippageModel):
     spread : float, optional
         spread / 2 will be added to buys and subtracted from sells.
     """
-    allowed_asset_types = (Equity, Future)
-
     def __init__(self, spread=0.0):
+        super(FixedSlippage, self).__init__()
         self.spread = spread
 
     def __repr__(self):
@@ -290,11 +281,13 @@ class FixedSlippage(SlippageModel):
         )
 
 
-class MarketImpactBase(object):
+class MarketImpactBase(SlippageModel):
     """
     Base class for slippage models which compute a simulated price impact
     according to a history lookback.
     """
+
+    NO_DATA_VOLATILITY_SLIPPAGE_IMPACT = 10.0 / 10000
 
     def __init__(self):
         super(MarketImpactBase, self).__init__()
@@ -317,13 +310,13 @@ class MarketImpactBase(object):
         raise NotImplementedError('get_txn_volume')
 
     @abstractmethod
-    def simulated_impact(self,
-                         order,
-                         current_price,
-                         current_volume,
-                         txn_volume,
-                         mean_volume,
-                         volatility):
+    def get_simulated_impact(self,
+                             order,
+                             current_price,
+                             current_volume,
+                             txn_volume,
+                             mean_volume,
+                             volatility):
         """
         Calculate simulated price impact.
 
@@ -340,7 +333,7 @@ class MarketImpactBase(object):
         ------
         int : impact on the current price.
         """
-        raise NotImplementedError('simulated_impact')
+        raise NotImplementedError('get_simulated_impact')
 
     def process_order(self, data, order):
         if order.open_amount == 0:
@@ -368,7 +361,7 @@ class MarketImpactBase(object):
         if mean_volume == 0 or np.isnan(volatility):
             # If this is the first day the contract exists or there is no
             # volume history, default to a conservative estimate of impact.
-            simulated_impact = price * NO_DATA_VOLATILITY_SLIPPAGE_IMPACT
+            simulated_impact = price * self.NO_DATA_VOLATILITY_SLIPPAGE_IMPACT
         else:
             simulated_impact = self.get_simulated_impact(
                 order=order,
@@ -407,14 +400,20 @@ class MarketImpactBase(object):
         try:
             values = self._window_data_cache.get(asset, data.current_session)
         except KeyError:
-            # Add a day because we want 'window_length' complete days,
-            # excluding the current day.
-            volume_history = data.history(
-                asset, 'volume', window_length + 1, '1d',
-            )
-            close_history = data.history(
-                asset, 'close', window_length + 1, '1d',
-            )
+            try:
+                # Add a day because we want 'window_length' complete days,
+                # excluding the current day.
+                volume_history = data.history(
+                    asset, 'volume', window_length + 1, '1d',
+                )
+                close_history = data.history(
+                    asset, 'close', window_length + 1, '1d',
+                )
+            except HistoryWindowStartsBeforeData:
+                # If there is not enough data to do a full history call, return
+                # values as if there was no data.
+                return 0, np.NaN
+
             # Exclude the first value of the percent change array because it is
             # always just NaN.
             close_volatility = close_history[:-1].pct_change()[1:].std(
@@ -429,7 +428,7 @@ class MarketImpactBase(object):
         return values['volume'], values['close']
 
 
-class VolatilityVolumeShare(MarketImpactBase, FutureSlippageModel):
+class VolatilityVolumeShare(MarketImpactBase):
     """
     Model slippage for futures contracts according to the following formula:
 
@@ -453,6 +452,8 @@ class VolatilityVolumeShare(MarketImpactBase, FutureSlippageModel):
         for all futures contracts is the same. If given a dictionary, it must
         map root symbols to the eta for contracts of that symbol.
     """
+
+    NO_DATA_VOLATILITY_SLIPPAGE_IMPACT = 7.5 / 10000
     allowed_asset_types = (Future,)
 
     def __init__(self, volume_limit, eta=ROOT_SYMBOL_TO_ETA):
@@ -503,3 +504,64 @@ class VolatilityVolumeShare(MarketImpactBase, FutureSlippageModel):
     def get_txn_volume(self, data, order):
         volume = data.current(order.asset, 'volume')
         return volume * self.volume_limit
+
+
+class FixedBasisPointsSlippage(SlippageModel):
+    """
+    Model slippage as a fixed percentage of fill price. Executes the full
+    order immediately.
+
+    Orders to buy will be filled at: `price + (price * basis_points * 0.0001)`.
+    Orders to sell will be filled at:
+        `price - (price * basis_points * 0.0001)`.
+
+    Parameters
+    ----------
+    basis_points : float, optional
+        Number of basis points of slippage to apply on each execution.
+
+    volume_limit : float, optional
+        fraction of the trading volume that can be filled each minute.
+    """
+    @expect_bounded(
+        basis_points=(0, None),
+        __funcname='FixedBasisPointsSlippage',
+    )
+    @expect_strictly_bounded(
+        volume_limit=(0, None),
+        __funcname='FixedBasisPointsSlippage',
+    )
+    def __init__(self, basis_points=5.0, volume_limit=0.1):
+        super(FixedBasisPointsSlippage, self).__init__()
+        self.basis_points = basis_points
+        self.percentage = self.basis_points / 10000.0
+        self.volume_limit = volume_limit
+
+    def __repr__(self):
+        return """
+{class_name}(
+    basis_points={basis_points},
+    volume_limit={volume_limit},
+)
+""".strip().format(
+            class_name=self.__class__.__name__,
+            basis_points=self.basis_points,
+            volume_limit=self.volume_limit,
+        )
+
+    def process_order(self, data, order):
+
+        volume = data.current(order.asset, "volume")
+        max_volume = int(self.volume_limit * volume)
+
+        price = data.current(order.asset, "close")
+        shares_to_fill = min(abs(order.open_amount),
+                             max_volume - self.volume_for_bar)
+
+        if shares_to_fill == 0:
+            raise LiquidityExceeded()
+
+        return (
+            price + price * (self.percentage * order.direction),
+            shares_to_fill * order.direction
+        )

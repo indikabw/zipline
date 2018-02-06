@@ -70,7 +70,7 @@ from .asset_writer import (
 from .asset_db_schema import (
     ASSET_DB_VERSION
 )
-from zipline.utils.control_flow import invert
+from zipline.utils.functional import invert
 from zipline.utils.memoize import lazyval
 from zipline.utils.numpy_utils import as_column
 from zipline.utils.preprocess import preprocess
@@ -266,7 +266,7 @@ class AssetFinder(object):
     # reference to an AssetFinder.
     PERSISTENT_TOKEN = "<AssetFinder>"
 
-    @preprocess(engine=coerce_string_to_eng)
+    @preprocess(engine=coerce_string_to_eng(require_exists=True))
     def __init__(self, engine, future_chain_predicates=CHAIN_PREDICATES):
         self.engine = engine
         metadata = sa.MetaData(bind=engine)
@@ -1364,6 +1364,7 @@ class PricingDataAssociable(with_metaclass(ABCMeta)):
     Includes Asset, Future, ContinuousFuture
     """
     pass
+
 
 PricingDataAssociable.register(Asset)
 PricingDataAssociable.register(Future)
